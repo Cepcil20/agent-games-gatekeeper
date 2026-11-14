@@ -10,22 +10,51 @@ const CIRCUIT_URLS = {
 };
 
 // ---------- secret / hmac ----------
-function secretBytes() {
+// The platform hands the secret as a 64-char hex string; implementations differ on
+// whether the HMAC key is the hex-decoded bytes or the UTF-8 string. Accept both on
+// verify, and sign each response with whichever key verified its request.
+function secretKeys() {
   const s = process.env.AGENT_GAMES_HMAC_SECRET || "";
-  if (/^[0-9a-fA-F]{64}$/.test(s)) return Buffer.from(s, "hex");
-  return Buffer.from(s, "utf8");
+  const keys = [];
+  if (/^[0-9a-fA-F]{64}$/.test(s)) keys.push({ label: "hex", key: Buffer.from(s, "hex") });
+  keys.push({ label: "utf8", key: Buffer.from(s, "utf8") });
+  return keys;
 }
-export function hmacHex(rawBody) {
-  return crypto.createHmac("sha256", secretBytes()).update(rawBody).digest("hex");
+function hmacWith(key, raw) { return crypto.createHmac("sha256", key).update(raw).digest(); }
+export function hmacHex(rawBody, keyLabel) {
+  const keys = secretKeys();
+  const k = (keyLabel && keys.find(x => x.label === keyLabel)) || keys[0];
+  return hmacWith(k.key, rawBody).toString("hex");
 }
-function sigOk(headerVal, rawBody) {
-  if (!headerVal) return false;
-  const given = String(headerVal).replace(/^sha256=/, "").trim().toLowerCase();
-  const want = hmacHex(rawBody);
+function eqStr(a, b) {
   try {
-    const a = Buffer.from(given, "utf8"), b = Buffer.from(want, "utf8");
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    const x = Buffer.from(a, "utf8"), y = Buffer.from(b, "utf8");
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
   } catch { return false; }
+}
+// Returns the label of the key whose HMAC matches the header, or null.
+function matchKey(headerVal, rawBody) {
+  if (!headerVal) return null;
+  const given = String(headerVal).replace(/^sha256=/, "").trim();
+  for (const { label, key } of secretKeys()) {
+    const d = hmacWith(key, rawBody);
+    if (eqStr(given, d.toString("hex")) || eqStr(given.toLowerCase(), d.toString("hex")) || eqStr(given, d.toString("base64"))) return label;
+  }
+  return null;
+}
+function diagnose(headerVal, rawBody, hdrs) {
+  try {
+    const out = { received: String(headerVal || ""), bodyLen: rawBody.length, body: rawBody.toString("utf8").slice(0, 600), candidates: {} };
+    for (const { label, key } of secretKeys()) {
+      out.candidates[label] = {
+        hex: hmacWith(key, rawBody).toString("hex"),
+        base64: hmacWith(key, rawBody).toString("base64"),
+        hexNl: hmacWith(key, Buffer.concat([rawBody, Buffer.from("\n")])).toString("hex"),
+      };
+    }
+    if (hdrs) out.headers = hdrs;
+    console.log("SIG401 " + JSON.stringify(out));
+  } catch {}
 }
 
 // ---------- state store (Upstash REST if configured, else in-memory) ----------
@@ -148,26 +177,27 @@ export async function handleTask(task) {
 }
 
 // ---------- request handler: (rawBody: Buffer, sigHeader: string) -> { status, bodyObj } ----------
-export async function handleRequest(rawBody, sigHeader) {
-  if (!sigOk(sigHeader, rawBody)) return { status: 401, body: { error: "invalid signature" }, sign: false };
+export async function handleRequest(rawBody, sigHeader, allHeaders) {
+  const keyLabel = matchKey(sigHeader, rawBody);
+  if (!keyLabel) { diagnose(sigHeader, rawBody, allHeaders); return { status: 401, body: { error: "invalid signature" }, sign: false }; }
   let msg;
   try { msg = JSON.parse(rawBody.toString("utf8")); } catch { return { status: 400, body: { error: "bad json" }, sign: false }; }
-  if (msg.type === "agent-games.preflight.v1") return { status: 200, body: { ok: true, protocolVersion: "v1" }, sign: true };
+  if (msg.type === "agent-games.preflight.v1") return { status: 200, body: { ok: true, protocolVersion: "v1" }, sign: true, keyLabel };
   if (msg.type === "agent-games.proof-gatekeeper.v1") {
     try {
       const body = await handleTask(msg);
-      return { status: 200, body, sign: true };
+      return { status: 200, body, sign: true, keyLabel };
     } catch (e) {
       console.error("task failed:", e && e.message ? e.message.slice(0, 200) : e);
-      return { status: 200, body: { decision: "REJECT", reason_code: "INTERNAL_ERROR" }, sign: true };
+      return { status: 200, body: { decision: "REJECT", reason_code: "INTERNAL_ERROR" }, sign: true, keyLabel };
     }
   }
   return { status: 400, body: { error: "unknown type" }, sign: false };
 }
 
-export function signedResponse({ status, body, sign }) {
+export function signedResponse({ status, body, sign, keyLabel }) {
   const text = JSON.stringify(body);
   const headers = { "content-type": "application/json" };
-  if (sign) headers["x-agent-games-signature"] = hmacHex(Buffer.from(text, "utf8"));
+  if (sign) headers["x-agent-games-signature"] = hmacHex(Buffer.from(text, "utf8"), keyLabel);
   return { status, headers, text };
 }
