@@ -8,7 +8,8 @@ export default async (req) => {
   }
   try {
     const raw = Buffer.from(await req.arrayBuffer());
-    const out = signedResponse(await handleRequest(raw, req.headers.get("x-agent-games-signature")));
+    const hdrs = {}; for (const [k, v] of req.headers) hdrs[k] = v;
+    const out = signedResponse(await handleRequest(raw, req.headers.get("x-agent-games-signature"), hdrs));
     return new Response(out.text, { status: out.status, headers: out.headers });
   } catch (e) {
     return new Response(JSON.stringify({ error: "server error" }), { status: 500, headers: { "content-type": "application/json" } });
