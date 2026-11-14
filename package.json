@@ -1,0 +1,9 @@
+{
+  "name": "agent-games-gatekeeper",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "snarkjs": "^0.7.5",
+    "js-sha3": "^0.9.3"
+  }
+}
